@@ -1,0 +1,8 @@
+docker run --rm \
+    --name=$MYSQL_HOST \
+    -e MYSQL_USER=$MYSQL_USER \
+    -e MYSQL_PASSWORD=$MYSQL_PASSWORD \
+    -e MYSQL_ROOT_PASSWORD=$MYSQL_ROOTPASSWORD \
+    -p 3306:3306 \
+    --net=$DOCKER_NETWORK \
+    $MYSQL_HOST

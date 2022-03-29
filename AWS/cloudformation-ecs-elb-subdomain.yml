@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  AppName:
+    Type: String
+    Description: Name of the app. Should be unique against other projects in the AWS account.
+  VPCID:
+    Type: String
+    Description: Virtual Private Cloud Id
+  Subnet1ID:
+    Type: String
+    Description: A subnet in the VPC
+  Subnet2ID:
+    Type: String
+    Description: A subnet in the VPC that's in a different Availability Zone as Subnet1ID
+  SubDomainName:
+    Type: String
+    Description: The subdomain to use for this app. Api will be located in "api.${SubDomainName}"
+  DBRootPassword:
+    Type: String
+    Description: Initial password for database root user
+Resources:
+  # CloudWatch
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${AppName}loggroup"
+  # ECR
+  MainRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}repository"
+  # ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}cluster"
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}taskexecutionrole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Statement:
+              Action:
+                - ses:SendEmail
+              Effect: Allow
+              Resource: '*'
+          PolicyName: send-mail
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AppName}containersg"
+      GroupDescription: Security group for container
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - ExecutionRole
+      - TaskRole
+      - MainRepository
+      - LogGroup
+    Properties:
+      Family: !Sub "${AppName}task"
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Sub "${AppName}container"
+          Image: !GetAtt MainRepository.RepositoryUri
+          PortMappings:
+            - ContainerPort: 5000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+      RequiresCompatibilities:
+        - FARGATE
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Cluster
+      - TaskDefinition
+      - ContainerSecurityGroup
+      - TargetGroup
+      - HTTPSLoadBalancerListener
+    Properties:
+      ServiceName: !Sub "${AppName}service"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref Subnet1ID
+            - !Ref Subnet2ID
+          SecurityGroups:
+            - !GetAtt ContainerSecurityGroup.GroupId
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerPort: 5000
+          ContainerName: !Sub "${AppName}container"
+  # Certificate Manager
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    DependsOn: DNS
+    Properties:
+      DomainName: !Sub "api.${SubDomainName}"
+      DomainValidationOptions:
+        - DomainName: !Sub "api.${SubDomainName}"
+          HostedZoneId: !Ref DNS
+      ValidationMethod: DNS
+  # Auto scaling
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn:
+      - AutoScalingRole
+      - Cluster
+      - Service
+    Properties:
+      MinCapacity: 0
+      MaxCapacity: 2
+      ResourceId: !Join ['/', [service, !Ref Cluster, !GetAtt Service.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+  ApiScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn:
+      - AutoScalingTarget
+    Properties:
+      PolicyName: !Sub "${AppName}svcscalecpu"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: 45.0
+  ApiScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn:
+      - AutoScalingTarget
+    Properties:
+      PolicyName: !Sub "${AppName}svcscalememory"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: 50.0
+  # Load balancer
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AppName}lbsg"
+      GroupDescription: Security group for load balancer
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - LoadBalancerSecurityGroup
+    Properties:
+      Name: !Sub "${AppName}elb"
+      Subnets:
+        - !Ref Subnet1ID
+        - !Ref Subnet2ID
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+  HTTPlistener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    DependsOn:
+      - LoadBalancer
+    Properties:
+      DefaultActions:
+        - Type: "redirect"
+          RedirectConfig:
+            Protocol: "HTTPS"
+            Port: 443
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: "HTTP_301"
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: "HTTP"
+  HTTPSLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+      - ACMCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      SslPolicy: "ELBSecurityPolicy-2016-08"
+      Certificates:
+        - CertificateArn: !Ref ACMCertificate
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: LoadBalancer
+    Properties:
+      TargetType: ip
+      Name: !Sub "${AppName}lbtg"
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VPCID
+  # Route 53
+  DNS:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      HostedZoneConfig:
+        Comment: !Sub "Hosted zone for ${AppName}"
+      Name: !Sub "${SubDomainName}."
+  ApiDomain:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - LoadBalancer
+      - DNS
+    Properties:
+      HostedZoneName: !Sub "${SubDomainName}."
+      Name: !Sub "api.${SubDomainName}"
+      Type: CNAME
+      TTL: 60
+      ResourceRecords:
+        - !GetAtt LoadBalancer.DNSName
+  # Database
+  MainDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: "20"
+      AutoMinorVersionUpgrade: True
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: True
+      DBInstanceClass: db.t2.micro
+      DBInstanceIdentifier: !Sub "${AppName}databaseinstance"
+      DBName: !Sub "${AppName}database"
+      EnableIAMDatabaseAuthentication: False
+      EnablePerformanceInsights: False
+      Engine: MySQL
+      EngineVersion: 8.0.16
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBRootPassword
+      MaxAllocatedStorage: 300
+      MonitoringInterval: 0
+      MultiAZ: False
+      Port: 3306
+      PubliclyAccessible: True
+      StorageEncrypted: False
+      StorageType: gp2
+  # Github Actions
+  GitHubActionsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AppName}githubuser"
+  GitHubActionsUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    DependsOn:
+      - GitHubActionsUser
+    Properties:
+      UserName: !Ref GitHubActionsUser
+      Serial: 1
+  GitHubActionsUserPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - GitHubActionsUser
+    Properties:
+      Users:
+        - !Ref GitHubActionsUser
+      PolicyName: !Sub "${AppName}githubactionspolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "iam:PassRole"
+              - "secretsmanager:GetSecretValue"
+              - "ecr:*"
+              - "ecs:*"
+              - "codedeploy:*"
+            Effect: Allow
+            Resource: "*"
+  # Secrets
+  Secrets:
+    Type: AWS::SecretsManager::Secret
+    DependsOn:
+      - MainDatabase
+    Properties:
+      Name: !Sub "${AppName}environmentvariables"
+      Description: "Backend environment variables"
+      SecretString: !Sub '{"MYSQL_HOST":"${MainDatabase.Endpoint.Address}","MYSQL_DB_NAME":"${AppName}_database","MYSQL_USER":"admin","MYSQL_PASSWORD":"${DBRootPassword}"}'
+  GitHubActionsCredentials:
+    Type: AWS::SecretsManager::Secret
+    DependsOn:
+      - GitHubActionsUserAccessKey
+    Properties:
+      Name: !Sub "${AppName}githubuser"
+      SecretString: !Sub '{"AccessKeyId":"${GitHubActionsUserAccessKey}","SecretAccessKey":"${GitHubActionsUserAccessKey.SecretAccessKey}"}"}'

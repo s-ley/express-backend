@@ -1,0 +1,18 @@
+# Docker
+docker
+
+# Mysql
+mysql
+
+# Scripts
+scripts
+
+# Node
+node_modules
+
+# Git
+.git
+.gitignore
+
+# IDEs
+.idea

@@ -1,0 +1,7 @@
+ARG PRODUCTION_TAG
+FROM ${PRODUCTION_TAG}
+
+WORKDIR /usr/src/app
+RUN npm i
+
+CMD ["npm", "run", "dev"]
